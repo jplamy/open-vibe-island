@@ -708,6 +708,8 @@ public extension CodexHookPayload {
                 return "Ghostty"
             case let value where value.contains("wezterm"):
                 return "WezTerm"
+            case "alacritty":
+                return "Alacritty"
             case "kaku":
                 return "Kaku"
             case "vscode":
@@ -735,6 +737,9 @@ public extension CodexHookPayload {
         }
         if environment["GHOSTTY_RESOURCES_DIR"] != nil {
             return "Ghostty"
+        }
+        if environment["ALACRITTY_SOCKET"] != nil {
+            return "Alacritty"
         }
 
         // JetBrains IDEs set TERMINAL_EMULATOR=JetBrains-JediTerm.

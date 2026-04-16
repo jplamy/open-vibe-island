@@ -1553,32 +1553,12 @@ final class AppModel {
         ingress: TrackedEventIngress
     ) {
         guard !wasAlreadyCompleted,
-              notificationSurfaceIsEligibleForPresentation(surface, ingress: ingress),
               let sessionID = surface.sessionID,
-              let session = state.session(id: sessionID) else {
+              state.session(id: sessionID) != nil else {
             return
         }
 
-        guard suppressFrontmostNotifications else {
-            presentNotificationSurface(surface)
-            return
-        }
-
-        notificationPresentationTask?.cancel()
-        notificationPresentationTask = Task { @MainActor [weak self] in
-            guard let self else {
-                return
-            }
-
-            let shouldSuppress = await self.isNotificationSessionAlreadyFrontmost(session)
-            guard !Task.isCancelled,
-                  !shouldSuppress,
-                  self.notificationSurfaceIsEligibleForPresentation(surface, ingress: ingress) else {
-                return
-            }
-
-            self.presentNotificationSurface(surface)
-        }
+        presentNotificationSurface(surface)
     }
 
     private func notificationSurfaceIsEligibleForPresentation(

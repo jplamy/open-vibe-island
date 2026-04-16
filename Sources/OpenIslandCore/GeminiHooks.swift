@@ -346,6 +346,10 @@ public extension GeminiHookPayload {
             return "Ghostty"
         }
 
+        if environment["ALACRITTY_SOCKET"] != nil {
+            return "Alacritty"
+        }
+
         if environment["WARP_IS_LOCAL_SHELL_SESSION"] != nil {
             return "Warp"
         }
@@ -362,6 +366,8 @@ public extension GeminiHookPayload {
             return "Warp"
         case let value? where value.contains("wezterm"):
             return "WezTerm"
+        case .some("alacritty"):
+            return "Alacritty"
         case .some("kaku"):
             return "Kaku"
         case .some("vscode"):

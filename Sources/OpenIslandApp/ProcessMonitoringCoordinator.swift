@@ -237,6 +237,10 @@ final class ProcessMonitoringCoordinator {
         // launch even when no sessions exist yet, so the app-server
         // coordinator can connect and report threads.
         let isCodexAppRunning = reconcileCodexAppRunningState(observedCodexAppRunning)
+
+        // Fix "Unknown" terminal names from process discovery data.
+        correctUnknownTerminalApps(activeProcesses: activeProcesses, sessions: &local)
+
         let sessions = local.sessions.filter(\.isTrackedLiveSession)
         guard !sessions.isEmpty else {
             // Flush local changes only if something actually changed.
@@ -1112,6 +1116,18 @@ final class ProcessMonitoringCoordinator {
                 guard !sessionOwnedByOtherProcess else { continue }
 
                 sessions[index].jumpTarget?.terminalTTY = processTTY
+                // Also adopt terminal app and tmux info from the process
+                // when the hook-provided value is missing or unknown.
+                if let processApp = process.terminalApp,
+                   (sessions[index].jumpTarget?.terminalApp == "Unknown" || sessions[index].jumpTarget?.terminalApp == nil) {
+                    sessions[index].jumpTarget?.terminalApp = processApp
+                }
+                if let tmuxTarget = process.tmuxTarget, sessions[index].jumpTarget?.tmuxTarget == nil {
+                    sessions[index].jumpTarget?.tmuxTarget = tmuxTarget
+                }
+                if let tmuxSocket = process.tmuxSocketPath, sessions[index].jumpTarget?.tmuxSocketPath == nil {
+                    sessions[index].jumpTarget?.tmuxSocketPath = tmuxSocket
+                }
                 sessions[index].attachmentState = .attached
                 sessions[index].updatedAt = .now
                 changed = true
@@ -1197,6 +1213,51 @@ final class ProcessMonitoringCoordinator {
             localState = SessionState(sessions: sessions)
         }
         return changed
+    }
+
+    /// One-pass correction: when a session's terminalApp is "Unknown" and a
+    /// discovered process shares the same TTY, adopt the process's terminal
+    /// info. Runs once per reconciliation cycle, only touching "Unknown" sessions.
+    private func correctUnknownTerminalApps(
+        activeProcesses: [ActiveProcessSnapshot],
+        sessions localState: inout SessionState
+    ) {
+        let claudeProcesses = activeProcesses.filter { $0.tool == .claudeCode }
+        guard !claudeProcesses.isEmpty else { return }
+
+        // Build a TTY → process lookup (one entry per TTY)
+        var processByTTY: [String: ActiveProcessSnapshot] = [:]
+        for p in claudeProcesses {
+            if let tty = p.terminalTTY.flatMap({ normalizedTTYForMatching($0) }) {
+                processByTTY[tty] = p
+            }
+        }
+        guard !processByTTY.isEmpty else { return }
+
+        var sessions = localState.sessions
+        var changed = false
+
+        for index in sessions.indices {
+            guard sessions[index].jumpTarget?.terminalApp == "Unknown" || sessions[index].jumpTarget?.terminalApp == nil,
+                  let sessionTTY = sessions[index].jumpTarget?.terminalTTY.flatMap({ normalizedTTYForMatching($0) }),
+                  let process = processByTTY[sessionTTY] else {
+                continue
+            }
+            if let app = process.terminalApp {
+                sessions[index].jumpTarget?.terminalApp = app
+            }
+            if let tmux = process.tmuxTarget, sessions[index].jumpTarget?.tmuxTarget == nil {
+                sessions[index].jumpTarget?.tmuxTarget = tmux
+            }
+            if let sock = process.tmuxSocketPath, sessions[index].jumpTarget?.tmuxSocketPath == nil {
+                sessions[index].jumpTarget?.tmuxSocketPath = sock
+            }
+            changed = true
+        }
+
+        if changed {
+            localState = SessionState(sessions: sessions)
+        }
     }
 
     // MARK: - Cross-tool sanitization
@@ -1368,6 +1429,8 @@ final class ProcessMonitoringCoordinator {
             return "Kaku"
         case "wezterm":
             return "WezTerm"
+        case "alacritty":
+            return "Alacritty"
         case "zellij":
             return "Zellij"
         // VS Code family

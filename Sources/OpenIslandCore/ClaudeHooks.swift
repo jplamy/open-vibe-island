@@ -1215,6 +1215,8 @@ public extension ClaudeHookPayload {
                 return "Warp"
             case let value where value.contains("ghostty"):
                 return "Ghostty"
+            case "alacritty":
+                return "Alacritty"
             case "kaku":
                 return "Kaku"
             case "wezterm":
@@ -1251,6 +1253,9 @@ public extension ClaudeHookPayload {
         }
         if environment["GHOSTTY_RESOURCES_DIR"] != nil {
             return "Ghostty"
+        }
+        if environment["ALACRITTY_SOCKET"] != nil {
+            return "Alacritty"
         }
 
         // JetBrains IDEs set TERMINAL_EMULATOR=JetBrains-JediTerm.

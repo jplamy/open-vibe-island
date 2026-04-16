@@ -84,6 +84,11 @@ struct TerminalJumpService {
             aliases: ["claude.app"]
         ),
         TerminalAppDescriptor(
+            displayName: "Alacritty",
+            bundleIdentifier: "org.alacritty",
+            aliases: ["alacritty"]
+        ),
+        TerminalAppDescriptor(
             displayName: "Kaku",
             bundleIdentifier: "fun.tw93.kaku",
             aliases: ["kaku"]
@@ -251,9 +256,20 @@ struct TerminalJumpService {
         // tmux sessions: switch pane first, then use the terminal-specific
         // jump to focus the correct window/tab (not just activate the app).
         if let tmuxTarget = target.tmuxTarget, !tmuxTarget.isEmpty {
-            let paneSelected = jumpToTmuxPane(target)
-
             let descriptor = resolveTerminalApp(preferredName: target.terminalApp)
+
+            // Alacritty: handle tmux jump entirely here — switch the active
+            // window's client to the target session. Skip jumpToTmuxPane which
+            // would interfere with its own client selection logic.
+            if descriptor?.bundleIdentifier == "org.alacritty" {
+                if jumpToAlacrittyTmuxSession(target) {
+                    return "Focused the matching tmux pane in Alacritty."
+                }
+                try openAction(["-b", "org.alacritty"])
+                return "Activated Alacritty."
+            }
+
+            let paneSelected = jumpToTmuxPane(target)
 
             // Use the full terminal-specific jump (AppleScript for Ghostty/iTerm,
             // CLI for WezTerm, etc.) to focus the correct window/tab.
@@ -607,13 +623,40 @@ struct TerminalJumpService {
             sessionName = tmuxTarget
         }
 
-        // Find the client TTY so we can explicitly target it with switch-client.
-        let clientTTY = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
-                                       args: ["list-clients", "-F", "#{client_tty}"])?
-            .components(separatedBy: "\n").first { !$0.isEmpty }
+        // Find the best client TTY for switch-client.
+        // Strategy: first, look for a client already attached to the target
+        // session (just activate its window). If none, pick the most recently
+        // active client and switch it to the target session.
+        let clientLines = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
+                                         args: ["list-clients", "-F", "#{client_tty}\t#{client_session}\t#{client_activity}"])?
+            .components(separatedBy: "\n").filter { !$0.isEmpty } ?? []
 
-        // Step 1: switch-client — point the client at the target session.
-        if let clientTTY = clientTTY {
+        var alreadyAttachedTTY: String?
+        var mostRecentTTY: String?
+        var mostRecentActivity: Int = 0
+
+        for line in clientLines {
+            let parts = line.split(separator: "\t", maxSplits: 2).map(String.init)
+            guard parts.count >= 2 else { continue }
+            let tty = parts[0]
+            let session = parts[1]
+            let activity = parts.count >= 3 ? Int(parts[2]) ?? 0 : 0
+
+            if session == sessionName {
+                alreadyAttachedTTY = tty
+            }
+            if activity > mostRecentActivity {
+                mostRecentActivity = activity
+                mostRecentTTY = tty
+            }
+        }
+
+        if let attachedTTY = alreadyAttachedTTY {
+            // A client is already viewing this session — no switch needed,
+            // just select the right window/pane below, then activate the app.
+            _ = attachedTTY  // used implicitly: tmux select-window/pane target the session
+        } else if let clientTTY = mostRecentTTY {
+            // No client on this session yet — switch the most recently active client.
             _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
                                args: ["switch-client", "-c", clientTTY, "-t", sessionName])
         }
@@ -793,6 +836,75 @@ struct TerminalJumpService {
         }
 
         return panes.first(where: { $0.id == paneID })?.tabPosition
+    }
+
+    /// Switch the frontmost Alacritty window's tmux client to the target session,
+    /// then select the correct window and pane. This avoids fragile AX window
+    /// title matching — each Alacritty window has its own tmux client, and
+    /// switch-client redirects whichever client is in the active window.
+    private func jumpToAlacrittyTmuxSession(_ target: JumpTarget) -> Bool {
+        guard let tmuxPath = resolveTmuxPath(),
+              let tmuxTarget = target.tmuxTarget, !tmuxTarget.isEmpty else {
+            return false
+        }
+
+        func socketArgs() -> [String] {
+            if let socketPath = target.tmuxSocketPath, !socketPath.isEmpty {
+                return ["-S", socketPath]
+            }
+            return []
+        }
+
+        let sessionName: String
+        if let colonIndex = tmuxTarget.firstIndex(of: ":") {
+            sessionName = String(tmuxTarget[tmuxTarget.startIndex..<colonIndex])
+        } else {
+            sessionName = tmuxTarget
+        }
+
+        let sessionWindow: String
+        if let dotIndex = tmuxTarget.lastIndex(of: ".") {
+            sessionWindow = String(tmuxTarget[tmuxTarget.startIndex..<dotIndex])
+        } else {
+            sessionWindow = tmuxTarget
+        }
+
+        // Activate Alacritty first so its window becomes the active tmux client
+        if let runningApp = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "org.alacritty"
+        }) {
+            runningApp.activate()
+            // Brief pause to let macOS process the activation
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        // Find the most recently active tmux client (the one in the
+        // now-frontmost Alacritty window) and switch it to the target session
+        let clientLines = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
+                                         args: ["list-clients", "-F", "#{client_tty}\t#{client_activity}"])?
+            .components(separatedBy: "\n").filter { !$0.isEmpty } ?? []
+
+        var bestTTY: String?
+        var bestActivity = 0
+        for line in clientLines {
+            let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let activity = Int(parts[1]) else { continue }
+            if activity > bestActivity {
+                bestActivity = activity
+                bestTTY = parts[0]
+            }
+        }
+
+        guard let clientTTY = bestTTY else { return false }
+
+        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
+                           args: ["switch-client", "-c", clientTTY, "-t", sessionName])
+        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
+                           args: ["select-window", "-t", sessionWindow])
+        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
+                           args: ["select-pane", "-t", tmuxTarget])
+
+        return true
     }
 
     private func jumpToGhosttyTerminal(_ target: JumpTarget) throws -> Bool {
