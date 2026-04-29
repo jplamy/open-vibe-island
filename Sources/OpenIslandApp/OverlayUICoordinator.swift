@@ -378,6 +378,17 @@ final class OverlayUICoordinator {
         }
 
         let session = activeIslandCardSession
+
+        // Never auto-close while the session is waiting for user action,
+        // or if the session was removed from state while the panel is open
+        // for a notification (process monitoring may temporarily evict it).
+        if session == nil && notchOpenReason == .notification {
+            return
+        }
+        if session?.phase == .waitingForApproval || session?.phase == .waitingForAnswer {
+            return
+        }
+
         guard islandSurface.matchesCurrentState(of: session) else {
             if notchOpenReason == .notification {
                 notchClose()

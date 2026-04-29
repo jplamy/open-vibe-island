@@ -838,21 +838,12 @@ struct TerminalJumpService {
         return panes.first(where: { $0.id == paneID })?.tabPosition
     }
 
-    /// Switch the frontmost Alacritty window's tmux client to the target session,
-    /// then select the correct window and pane. This avoids fragile AX window
-    /// title matching — each Alacritty window has its own tmux client, and
-    /// switch-client redirects whichever client is in the active window.
+    /// Switch Alacritty's tmux client to the target session.
+    /// Simple approach: activate Alacritty, then `tmux switch-client -t session`.
     private func jumpToAlacrittyTmuxSession(_ target: JumpTarget) -> Bool {
         guard let tmuxPath = resolveTmuxPath(),
               let tmuxTarget = target.tmuxTarget, !tmuxTarget.isEmpty else {
             return false
-        }
-
-        func socketArgs() -> [String] {
-            if let socketPath = target.tmuxSocketPath, !socketPath.isEmpty {
-                return ["-S", socketPath]
-            }
-            return []
         }
 
         let sessionName: String
@@ -862,47 +853,16 @@ struct TerminalJumpService {
             sessionName = tmuxTarget
         }
 
-        let sessionWindow: String
-        if let dotIndex = tmuxTarget.lastIndex(of: ".") {
-            sessionWindow = String(tmuxTarget[tmuxTarget.startIndex..<dotIndex])
-        } else {
-            sessionWindow = tmuxTarget
-        }
+        // Switch tmux FIRST, before activating Alacritty.
+        // This ensures when Alacritty comes to the front, it already
+        // shows the correct session.
+        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: [], args: ["switch-client", "-t", sessionName])
+        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: [], args: ["select-window", "-t", tmuxTarget])
+        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: [], args: ["select-pane", "-t", tmuxTarget])
 
-        // Activate Alacritty first so its window becomes the active tmux client
-        if let runningApp = NSWorkspace.shared.runningApplications.first(where: {
-            $0.bundleIdentifier == "org.alacritty"
-        }) {
-            runningApp.activate()
-            // Brief pause to let macOS process the activation
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-
-        // Find the most recently active tmux client (the one in the
-        // now-frontmost Alacritty window) and switch it to the target session
-        let clientLines = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
-                                         args: ["list-clients", "-F", "#{client_tty}\t#{client_activity}"])?
-            .components(separatedBy: "\n").filter { !$0.isEmpty } ?? []
-
-        var bestTTY: String?
-        var bestActivity = 0
-        for line in clientLines {
-            let parts = line.split(separator: "\t", maxSplits: 1).map(String.init)
-            guard parts.count == 2, let activity = Int(parts[1]) else { continue }
-            if activity > bestActivity {
-                bestActivity = activity
-                bestTTY = parts[0]
-            }
-        }
-
-        guard let clientTTY = bestTTY else { return false }
-
-        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
-                           args: ["switch-client", "-c", clientTTY, "-t", sessionName])
-        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
-                           args: ["select-window", "-t", sessionWindow])
-        _ = runTmuxCommand(tmuxPath: tmuxPath, socketArgs: socketArgs(),
-                           args: ["select-pane", "-t", tmuxTarget])
+        // Activate Alacritty via open(1) — more reliable than
+        // NSRunningApplication.activate() from a GUI app context.
+        try? openAction(["-a", "Alacritty"])
 
         return true
     }

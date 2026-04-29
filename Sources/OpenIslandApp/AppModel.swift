@@ -1311,21 +1311,34 @@ final class AppModel {
         jump(to: focusedSession?.jumpTarget)
     }
 
+    /// ID of the session targeted by the most recent jump, used to
+    /// prevent a rapid second jump (from double-click UI re-sort)
+    /// from cancelling and overriding the first one.
+    private var activeJumpSessionID: String?
+
     func jumpToSession(_ session: AgentSession) {
         guard let jumpTarget = session.jumpTarget,
               jumpTarget.terminalApp.lowercased() != "unknown" else {
             lastActionMessage = "Cannot jump: terminal app is unknown."
             return
         }
-        jump(to: jumpTarget)
+        jump(to: jumpTarget, sessionID: session.id)
     }
 
-    private func jump(to jumpTarget: JumpTarget?) {
+    private func jump(to jumpTarget: JumpTarget?, sessionID: String? = nil) {
         guard let jumpTarget else {
             lastActionMessage = "No jump target is available yet."
             return
         }
 
+        // If a jump is already in flight for a different session and was
+        // triggered very recently, this is a parasitic double-fire from
+        // the UI re-sorting rows between clicks. Drop it.
+        if let activeID = activeJumpSessionID, activeID != sessionID, jumpTask != nil {
+            return
+        }
+
+        activeJumpSessionID = sessionID
         let shouldDelayForDismissAnimation = isOverlayVisible
         let jumpAction = terminalJumpAction
 
@@ -1346,9 +1359,11 @@ final class AppModel {
                 }
 
                 self?.lastActionMessage = result
+                self?.activeJumpSessionID = nil
             } catch is CancellationError {
                 return
             } catch {
+                self?.activeJumpSessionID = nil
                 guard !Task.isCancelled else {
                     return
                 }
@@ -1553,12 +1568,35 @@ final class AppModel {
         ingress: TrackedEventIngress
     ) {
         guard !wasAlreadyCompleted,
+              notificationSurfaceIsEligibleForPresentation(surface, ingress: ingress),
               let sessionID = surface.sessionID,
-              state.session(id: sessionID) != nil else {
+              let session = state.session(id: sessionID) else {
             return
         }
 
-        presentNotificationSurface(surface)
+        // Always show actionable notifications (permissions, questions)
+        // immediately. For non-actionable ones (completions), respect the
+        // frontmost suppression setting.
+        let isActionable = session.phase == .waitingForApproval || session.phase == .waitingForAnswer
+
+        if isActionable || !suppressFrontmostNotifications {
+            presentNotificationSurface(surface)
+            return
+        }
+
+        // Non-actionable + suppression enabled: check if the session is
+        // already visible in the frontmost terminal.
+        notificationPresentationTask?.cancel()
+        notificationPresentationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let shouldSuppress = await self.isNotificationSessionAlreadyFrontmost(session)
+            guard !Task.isCancelled,
+                  !shouldSuppress,
+                  self.notificationSurfaceIsEligibleForPresentation(surface, ingress: ingress) else {
+                return
+            }
+            self.presentNotificationSurface(surface)
+        }
     }
 
     private func notificationSurfaceIsEligibleForPresentation(
