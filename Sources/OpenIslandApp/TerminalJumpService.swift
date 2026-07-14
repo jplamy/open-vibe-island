@@ -402,11 +402,19 @@ struct TerminalJumpService {
                 if let workingDirectory = target.workingDirectory {
                     let opened = jumpToJetBrainsProject(workingDirectory, bundleIdentifier: id)
                     if opened {
-                        return "Focused the matching \(descriptor.displayName) project."
+                        // Best-effort: switch to the matching terminal tab.
+                        // We delay briefly to let IntelliJ raise the window.
+                        Thread.sleep(forTimeInterval: 0.2)
+                        let switched = jumpToJetBrainsTerminalTab(target, bundleIdentifier: id)
+                        return switched
+                            ? "Focused the matching \(descriptor.displayName) terminal tab."
+                            : "Focused the matching \(descriptor.displayName) project."
                     }
                 }
                 if appIsRunning {
                     try openAction(["-b", id])
+                    Thread.sleep(forTimeInterval: 0.2)
+                    _ = jumpToJetBrainsTerminalTab(target, bundleIdentifier: id)
                     return "Activated \(descriptor.displayName)."
                 }
             default:
@@ -511,6 +519,119 @@ struct TerminalJumpService {
             return false
         }
         return processRunner(cli, [projectPath])
+    }
+
+    /// Switch to the matching terminal tab inside a JetBrains IDE.
+    ///
+    /// Strategy: the tab labels in the Terminal tool window are exposed as
+    /// AXStaticText elements with `description` set to the tab name. They
+    /// have no AX actions, so we locate the element's screen position and
+    /// post a synthetic CGEvent mouse click.
+    ///
+    /// Match heuristics (in order, first hit wins):
+    ///   1. tab desc == basename of workingDirectory
+    ///   2. tab desc is contained in workingDirectory
+    ///   3. tab desc is contained in paneTitle
+    ///   4. basename of workingDirectory contains tab desc
+    @discardableResult
+    private func jumpToJetBrainsTerminalTab(_ target: JumpTarget, bundleIdentifier: String) -> Bool {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == bundleIdentifier
+        }) else { return false }
+
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, &focusedRef)
+        guard let win = focusedRef else { return false }
+        let window = win as! AXUIElement
+
+        // Collect candidate tab elements: AXStaticText inside a group whose
+        // description ends with "Tool Window" (terminal tool window).
+        var candidates: [AXUIElement] = []
+        collectTerminalTabCandidates(in: window, into: &candidates)
+        guard !candidates.isEmpty else { return false }
+
+        let basename = target.workingDirectory.map { ($0 as NSString).lastPathComponent } ?? ""
+        let cwd = target.workingDirectory ?? ""
+        let paneTitle = target.paneTitle
+
+        // Find best match
+        var matched: AXUIElement?
+        for candidate in candidates {
+            var descRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(candidate, kAXDescriptionAttribute as CFString, &descRef)
+            guard let desc = descRef as? String, !desc.isEmpty else { continue }
+            // Skip the tool window's own labels (e.g. "Terminal", "Local (2)").
+            if desc == "Terminal" || desc.hasPrefix("Local (") || desc.hasPrefix("Local ") && desc.contains("(") {
+                continue
+            }
+            if desc == basename
+                || (!cwd.isEmpty && cwd.contains(desc))
+                || paneTitle.contains(desc)
+                || (!basename.isEmpty && basename.contains(desc)) {
+                matched = candidate
+                break
+            }
+        }
+
+        guard let tab = matched else { return false }
+
+        // Get tab's screen position and post a click event.
+        var posRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(tab, kAXPositionAttribute as CFString, &posRef)
+        var sizeRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(tab, kAXSizeAttribute as CFString, &sizeRef)
+        guard let p = posRef, let s = sizeRef else { return false }
+        var pos = CGPoint.zero
+        var size = CGSize.zero
+        AXValueGetValue(p as! AXValue, .cgPoint, &pos)
+        AXValueGetValue(s as! AXValue, .cgSize, &size)
+
+        let clickPoint = CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
+        let source = CGEventSource(stateID: .hidSystemState)
+        let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: clickPoint, mouseButton: .left)
+        let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: clickPoint, mouseButton: .left)
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+        return true
+    }
+
+    private func collectTerminalTabCandidates(in element: AXUIElement, into result: inout [AXUIElement], depth: Int = 0) {
+        guard depth < 10 else { return }
+
+        var descRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef)
+        let desc = descRef as? String ?? ""
+
+        // If this is a tool window group whose desc looks like a terminal tool
+        // window ("Local Tool Window", "Local (N) Tool Window"), collect all
+        // AXStaticText children with non-empty desc.
+        let isTerminalToolWindow = desc.hasSuffix("Tool Window")
+            && (desc.hasPrefix("Local") || desc.contains("Terminal"))
+
+        if isTerminalToolWindow {
+            var kidsRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &kidsRef)
+            if let kids = kidsRef as? [AXUIElement] {
+                for kid in kids {
+                    var roleRef: CFTypeRef?
+                    AXUIElementCopyAttributeValue(kid, kAXRoleAttribute as CFString, &roleRef)
+                    if (roleRef as? String) == "AXStaticText" {
+                        result.append(kid)
+                    }
+                }
+            }
+            return
+        }
+
+        // Recurse
+        var kidsRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &kidsRef)
+        if let kids = kidsRef as? [AXUIElement] {
+            for kid in kids {
+                collectTerminalTabCandidates(in: kid, into: &result, depth: depth + 1)
+            }
+        }
     }
 
     private func jumpToCmuxTerminal(_ target: JumpTarget) -> Bool {
