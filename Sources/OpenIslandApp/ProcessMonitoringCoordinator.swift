@@ -48,6 +48,18 @@ final class ProcessMonitoringCoordinator {
     @ObservationIgnored
     private var wasCodexAppRunning = false
 
+    /// Cached Codex.app liveness, kept current by NSWorkspace launch /
+    /// termination notifications so the monitoring loop never has to scan
+    /// `NSWorkspace.shared.runningApplications` on its hot path. Re-synced
+    /// from a full scan on every full reconcile as a safety net.
+    @ObservationIgnored
+    private var cachedCodexAppRunning: Bool?
+
+    /// Tokens for the NSWorkspace app-lifecycle observers. The coordinator
+    /// lives for the whole process lifetime, so these are never removed.
+    @ObservationIgnored
+    private var workspaceAppLifecycleObservers: [NSObjectProtocol] = []
+
     private static let startupPollInterval: TimeInterval = 2
     private static let codexAppRunningProbeInterval: TimeInterval = 2
     private static let activePollInterval: TimeInterval = 60
@@ -69,15 +81,21 @@ final class ProcessMonitoringCoordinator {
 
     static func monitoringWakeInterval(
         isResolvingInitialLiveSessions: Bool,
-        hasTrackedLiveSessions: Bool
+        hasTrackedLiveSessions: Bool,
+        isCodexAppRunning: Bool
     ) -> TimeInterval {
-        min(
-            codexAppRunningProbeInterval,
-            monitoringPollInterval(
-                isResolvingInitialLiveSessions: isResolvingInitialLiveSessions,
-                hasTrackedLiveSessions: hasTrackedLiveSessions
-            )
+        let pollInterval = monitoringPollInterval(
+            isResolvingInitialLiveSessions: isResolvingInitialLiveSessions,
+            hasTrackedLiveSessions: hasTrackedLiveSessions
         )
+        // The short probe cadence only exists to drive the Codex.app
+        // maintenance tick. When Codex.app is not running, app launch /
+        // termination is observed via NSWorkspace notifications instead of
+        // polling, so the loop can sleep until the next full reconcile.
+        guard isCodexAppRunning else {
+            return pollInterval
+        }
+        return min(codexAppRunningProbeInterval, pollInterval)
     }
 
     static func shouldPerformFullMonitorReconcile(
@@ -107,6 +125,8 @@ final class ProcessMonitoringCoordinator {
         guard sessionAttachmentMonitorTask == nil else {
             return
         }
+
+        observeWorkspaceAppLifecycleIfNeeded()
 
         sessionAttachmentMonitorTask = Task { @MainActor [weak self] in
             guard let self else {
@@ -150,7 +170,10 @@ final class ProcessMonitoringCoordinator {
 
                         return (s, g, t, j)
                     }.value
+                    // Full scan re-syncs the notification-driven cache in case
+                    // a launch/termination notification was ever missed.
                     let isCodexAppRunning = Self.isCodexDesktopAppRunning()
+                    self.cachedCodexAppRunning = isCodexAppRunning
                     self.reconcileSessionAttachments(
                         activeProcesses: snapshots,
                         ghosttyAvailability: ghosttyAvail,
@@ -169,7 +192,10 @@ final class ProcessMonitoringCoordinator {
                     nextFullReconcileAt = Date().addingTimeInterval(pollInterval)
                     hadTrackedLiveSessions = self.state.sessions.contains(where: \.isTrackedLiveSession)
                 } else {
-                    let isCodexAppRunning = self.reconcileCodexAppRunningState()
+                    // Short wake ticks only run while Codex.app is alive (see
+                    // monitoringWakeInterval); liveness comes from the
+                    // notification-driven cache, not a runningApplications scan.
+                    let isCodexAppRunning = self.reconcileCodexAppRunningState(self.cachedCodexAppRunning)
                     if isCodexAppRunning {
                         self.onCodexAppMaintenanceTick?()
                     }
@@ -178,11 +204,56 @@ final class ProcessMonitoringCoordinator {
 
                 let wakeInterval = Self.monitoringWakeInterval(
                     isResolvingInitialLiveSessions: self.isResolvingInitialLiveSessions,
-                    hasTrackedLiveSessions: self.state.sessions.contains(where: \.isTrackedLiveSession)
+                    hasTrackedLiveSessions: self.state.sessions.contains(where: \.isTrackedLiveSession),
+                    isCodexAppRunning: self.cachedCodexAppRunning ?? false
                 )
                 try? await Task.sleep(for: .milliseconds(Int(wakeInterval * 1_000)))
             }
         }
+    }
+
+    /// Observe app launch / termination so Codex.app liveness is event-driven
+    /// instead of polled every wake tick via `runningApplications` scans.
+    private func observeWorkspaceAppLifecycleIfNeeded() {
+        guard workspaceAppLifecycleObservers.isEmpty else {
+            return
+        }
+
+        let center = NSWorkspace.shared.notificationCenter
+        let notifications: [(Notification.Name, Bool)] = [
+            (NSWorkspace.didLaunchApplicationNotification, true),
+            (NSWorkspace.didTerminateApplicationNotification, false),
+        ]
+        for (name, isRunning) in notifications {
+            let observer = center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      app.bundleIdentifier == "com.openai.codex" else {
+                    return
+                }
+                MainActor.assumeIsolated {
+                    guard let self else {
+                        return
+                    }
+                    self.cachedCodexAppRunning = isRunning
+                    self.reconcileCodexAppRunningState(isRunning)
+                    self.pokeMonitoringLoop()
+                }
+            }
+            workspaceAppLifecycleObservers.append(observer)
+        }
+    }
+
+    /// Wake the monitoring loop immediately: cancel the pending sleep and
+    /// restart with a fresh full-reconcile deadline. Used when Codex.app
+    /// launches / terminates and when a session starts, so attachments
+    /// resolve right away even while the loop sleeps at the idle cadence.
+    private func pokeMonitoringLoop() {
+        guard sessionAttachmentMonitorTask != nil else {
+            return
+        }
+        sessionAttachmentMonitorTask?.cancel()
+        sessionAttachmentMonitorTask = nil
+        startMonitoringIfNeeded()
     }
 
     @discardableResult
@@ -343,6 +414,12 @@ final class ProcessMonitoringCoordinator {
         }
 
         state.markSingleSessionAlive(sessionID: sessionID)
+
+        // A freshly started session needs its terminal attachment resolved
+        // promptly; wake the loop instead of waiting out the idle cadence.
+        if case .sessionStarted = event {
+            pokeMonitoringLoop()
+        }
     }
 
     private func sessionID(for event: AgentEvent) -> String? {

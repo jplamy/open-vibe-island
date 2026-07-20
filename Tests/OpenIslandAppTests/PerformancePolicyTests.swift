@@ -40,14 +40,36 @@ struct PerformancePolicyTests {
 
     @MainActor
     @Test
-    func codexDesktopProbeKeepsShortWakeCadenceWhileFullReconcileBacksOff() {
+    func codexDesktopMaintenanceKeepsShortWakeCadenceOnlyWhileCodexAppRuns() {
         #expect(ProcessMonitoringCoordinator.monitoringWakeInterval(
             isResolvingInitialLiveSessions: false,
-            hasTrackedLiveSessions: false
+            hasTrackedLiveSessions: false,
+            isCodexAppRunning: true
         ) == 2)
         #expect(ProcessMonitoringCoordinator.monitoringWakeInterval(
             isResolvingInitialLiveSessions: false,
-            hasTrackedLiveSessions: true
+            hasTrackedLiveSessions: true,
+            isCodexAppRunning: true
+        ) == 2)
+    }
+
+    @MainActor
+    @Test
+    func monitoringWakeBacksOffToPollCadenceWhileCodexAppIsNotRunning() {
+        #expect(ProcessMonitoringCoordinator.monitoringWakeInterval(
+            isResolvingInitialLiveSessions: false,
+            hasTrackedLiveSessions: false,
+            isCodexAppRunning: false
+        ) == 300)
+        #expect(ProcessMonitoringCoordinator.monitoringWakeInterval(
+            isResolvingInitialLiveSessions: false,
+            hasTrackedLiveSessions: true,
+            isCodexAppRunning: false
+        ) == 60)
+        #expect(ProcessMonitoringCoordinator.monitoringWakeInterval(
+            isResolvingInitialLiveSessions: true,
+            hasTrackedLiveSessions: false,
+            isCodexAppRunning: false
         ) == 2)
     }
 
