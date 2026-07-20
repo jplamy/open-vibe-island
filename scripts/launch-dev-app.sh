@@ -35,7 +35,9 @@ setup_binary="$build_root/OpenIslandSetup"
 
 python3 "$brand_script"
 if [ "$skip_setup" = false ]; then
-  "$setup_binary" install --hooks-binary "$hooks_binary"
+  # Claude-only listening: keep the Claude hooks fresh; other agents'
+  # hooks are intentionally left uninstalled (agentIntent.* = uninstalled).
+  "$setup_binary" installClaude --hooks-binary "$hooks_binary"
 fi
 
 mkdir -p "$bundle_dir/Contents/MacOS" "$bundle_dir/Contents/Helpers" "$bundle_dir/Contents/Resources" "$bundle_dir/Contents/Frameworks"

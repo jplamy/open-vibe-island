@@ -28,6 +28,9 @@ private struct SetupCommand {
         case installKimi
         case uninstallKimi
         case statusKimi
+        case uninstallGemini
+        case uninstallCursor
+        case uninstallOpenCode
     }
 
     let action: Action
@@ -117,6 +120,12 @@ private struct SetupCommand {
             try uninstallKimi()
         case .statusKimi:
             try statusKimi()
+        case .uninstallGemini:
+            try uninstallGemini()
+        case .uninstallCursor:
+            try uninstallCursor()
+        case .uninstallOpenCode:
+            try uninstallOpenCode()
         }
     }
 
@@ -223,6 +232,30 @@ private struct SetupCommand {
         print("Installed Open Island Kimi hooks.")
         print("Kimi dir: \(status.kimiDirectory.path)")
         print("Hooks binary: \(hooksBinary.path)")
+    }
+
+    private func uninstallGemini() throws {
+        let manager = GeminiHookInstallationManager()
+        let status = try manager.uninstall()
+
+        print("Removed Open Island Gemini hooks.")
+        print("Gemini dir: \(status.geminiDirectory.path)")
+    }
+
+    private func uninstallCursor() throws {
+        let manager = CursorHookInstallationManager()
+        let status = try manager.uninstall()
+
+        print("Removed Open Island Cursor hooks.")
+        print("Cursor dir: \(status.cursorDirectory.path)")
+    }
+
+    private func uninstallOpenCode() throws {
+        let manager = OpenCodePluginInstallationManager()
+        let status = try manager.uninstall()
+
+        print("Removed Open Island OpenCode plugin.")
+        print("Plugin file: \(status.pluginFileURL.path)")
     }
 
     private func uninstallKimi() throws {
