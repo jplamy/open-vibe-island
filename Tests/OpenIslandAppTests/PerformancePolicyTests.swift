@@ -95,6 +95,22 @@ struct PerformancePolicyTests {
         ))
     }
 
+    @MainActor
+    @Test
+    func registryPersistenceSkipsWhenRecordsAreUnchanged() {
+        #expect(SessionDiscoveryCoordinator.shouldPersistRecords(["a"], lastSaved: nil))
+        #expect(SessionDiscoveryCoordinator.shouldPersistRecords(["a"], lastSaved: ["b"]))
+        #expect(!SessionDiscoveryCoordinator.shouldPersistRecords(["a"], lastSaved: ["a"]))
+        #expect(SessionDiscoveryCoordinator.shouldPersistRecords([String](), lastSaved: nil))
+        #expect(!SessionDiscoveryCoordinator.shouldPersistRecords([String](), lastSaved: []))
+    }
+
+    @MainActor
+    @Test
+    func registryPersistenceDebounceCoalescesEventBursts() {
+        #expect(SessionDiscoveryCoordinator.persistenceDebounceMilliseconds >= 1_000)
+    }
+
     @Test
     func inactiveSessionDotDoesNotRequireAnimationTimeline() {
         #expect(IslandSessionStateIndicator.animatedDot.timelineInterval(

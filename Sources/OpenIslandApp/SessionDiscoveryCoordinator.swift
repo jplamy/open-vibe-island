@@ -72,6 +72,21 @@ final class SessionDiscoveryCoordinator {
     @ObservationIgnored
     private var cursorSessionPersistenceTask: Task<Void, Never>?
 
+    // Last records handed to a persistence task, per registry. Reset to nil
+    // when a write fails so the next schedule retries. Guards against
+    // re-encoding + fsyncing identical data on every reconcile / bridge event.
+    @ObservationIgnored
+    private var lastSavedCodexRecords: [CodexTrackedSessionRecord]?
+
+    @ObservationIgnored
+    private var lastSavedClaudeRecords: [ClaudeTrackedSessionRecord]?
+
+    @ObservationIgnored
+    private var lastSavedOpenCodeRecords: [OpenCodeTrackedSessionRecord]?
+
+    @ObservationIgnored
+    private var lastSavedCursorRecords: [CursorTrackedSessionRecord]?
+
     private var state: SessionState {
         get { stateAccessor?() ?? SessionState() }
         set {
@@ -472,38 +487,58 @@ final class SessionDiscoveryCoordinator {
 
     // MARK: - Persistence scheduling
 
+    /// Debounce window before a scheduled registry write hits the disk.
+    /// Wide enough to coalesce the bursts of bridge events an active agent
+    /// session produces (each event re-schedules persistence); the registries
+    /// are only a warm-start cache, discovery rebuilds them on launch.
+    static let persistenceDebounceMilliseconds = 2_000
+
+    /// A registry write is only worth an encode + fsync when the records
+    /// actually differ from what was last persisted.
+    static func shouldPersistRecords<Record: Equatable>(
+        _ records: [Record],
+        lastSaved: [Record]?
+    ) -> Bool {
+        records != lastSaved
+    }
+
     private static func persistenceTask(
+        onFailure: @escaping @MainActor () -> Void,
         operation: @escaping @Sendable () throws -> Void
     ) -> Task<Void, Never> {
         Task.detached(priority: .utility) {
             do {
-                try await Task.sleep(for: .milliseconds(250))
+                try await Task.sleep(for: .milliseconds(Self.persistenceDebounceMilliseconds))
                 try Task.checkCancellation()
                 try operation()
             } catch is CancellationError {
                 return
             } catch {
-                return
+                await onFailure()
             }
         }
     }
 
     func scheduleCodexSessionPersistence() {
-        codexSessionPersistenceTask?.cancel()
-
         let records = state.sessions
             .filter { $0.isTrackedLiveCodexSession && $0.updatedAt >= Date.now.addingTimeInterval(-86_400) }
             .map(CodexTrackedSessionRecord.init(session:))
+        guard Self.shouldPersistRecords(records, lastSaved: lastSavedCodexRecords) else {
+            return
+        }
+
+        codexSessionPersistenceTask?.cancel()
+        lastSavedCodexRecords = records
         let store = codexSessionStore
 
-        codexSessionPersistenceTask = Self.persistenceTask {
+        codexSessionPersistenceTask = Self.persistenceTask(
+            onFailure: { [weak self] in self?.lastSavedCodexRecords = nil }
+        ) {
             try store.save(records)
         }
     }
 
     func scheduleClaudeSessionPersistence() {
-        claudeSessionPersistenceTask?.cancel()
-
         let prefix = syntheticClaudeSessionPrefix
         let records = state.sessions
             .filter {
@@ -514,16 +549,22 @@ final class SessionDiscoveryCoordinator {
                     && ($0.jumpTarget != nil || $0.claudeMetadata?.transcriptPath != nil)
             }
             .map(ClaudeTrackedSessionRecord.init(session:))
+        guard Self.shouldPersistRecords(records, lastSaved: lastSavedClaudeRecords) else {
+            return
+        }
+
+        claudeSessionPersistenceTask?.cancel()
+        lastSavedClaudeRecords = records
         let registry = claudeSessionRegistry
 
-        claudeSessionPersistenceTask = Self.persistenceTask {
+        claudeSessionPersistenceTask = Self.persistenceTask(
+            onFailure: { [weak self] in self?.lastSavedClaudeRecords = nil }
+        ) {
             try registry.save(records)
         }
     }
 
     func scheduleOpenCodeSessionPersistence() {
-        openCodeSessionPersistenceTask?.cancel()
-
         let records = state.sessions
             .filter {
                 $0.tool == .openCode
@@ -531,16 +572,22 @@ final class SessionDiscoveryCoordinator {
                     && $0.updatedAt >= Date.now.addingTimeInterval(-86_400)
             }
             .map(OpenCodeTrackedSessionRecord.init(session:))
+        guard Self.shouldPersistRecords(records, lastSaved: lastSavedOpenCodeRecords) else {
+            return
+        }
+
+        openCodeSessionPersistenceTask?.cancel()
+        lastSavedOpenCodeRecords = records
         let registry = openCodeSessionRegistry
 
-        openCodeSessionPersistenceTask = Self.persistenceTask {
+        openCodeSessionPersistenceTask = Self.persistenceTask(
+            onFailure: { [weak self] in self?.lastSavedOpenCodeRecords = nil }
+        ) {
             try registry.save(records)
         }
     }
 
     func scheduleCursorSessionPersistence() {
-        cursorSessionPersistenceTask?.cancel()
-
         let records = state.sessions
             .filter {
                 $0.tool == .cursor
@@ -549,9 +596,17 @@ final class SessionDiscoveryCoordinator {
                     && ($0.jumpTarget != nil || $0.cursorMetadata?.conversationId != nil)
             }
             .map(CursorTrackedSessionRecord.init(session:))
+        guard Self.shouldPersistRecords(records, lastSaved: lastSavedCursorRecords) else {
+            return
+        }
+
+        cursorSessionPersistenceTask?.cancel()
+        lastSavedCursorRecords = records
         let registry = cursorSessionRegistry
 
-        cursorSessionPersistenceTask = Self.persistenceTask {
+        cursorSessionPersistenceTask = Self.persistenceTask(
+            onFailure: { [weak self] in self?.lastSavedCursorRecords = nil }
+        ) {
             try registry.save(records)
         }
     }
