@@ -4,9 +4,14 @@ set -euo pipefail
 
 
 skip_setup=false
+# The bundle runs all day as a companion app: default to the optimized
+# release build. Pass --debug for a debuggable (-Onone) build.
+build_config=release
 for arg in "$@"; do
   case "$arg" in
     --skip-setup) skip_setup=true ;;
+    --debug) build_config=debug ;;
+    --release) build_config=release ;;
   esac
 done
 
@@ -19,11 +24,11 @@ bundle_binary="$bundle_dir/Contents/MacOS/OpenIslandApp"
 
 cd "$repo_root"
 
-swift build -c debug --product OpenIslandApp
-swift build -c debug --product OpenIslandHooks
-swift build -c debug --product OpenIslandSetup
+swift build -c "$build_config" --product OpenIslandApp
+swift build -c "$build_config" --product OpenIslandHooks
+swift build -c "$build_config" --product OpenIslandSetup
 
-build_root="$(swift build -c debug --show-bin-path)"
+build_root="$(swift build -c "$build_config" --show-bin-path)"
 app_binary="$build_root/OpenIslandApp"
 hooks_binary="$build_root/OpenIslandHooks"
 setup_binary="$build_root/OpenIslandSetup"
