@@ -515,10 +515,68 @@ struct TerminalJumpService {
     ]
 
     private func jumpToJetBrainsProject(_ projectPath: String, bundleIdentifier: String) -> Bool {
+        // If the IDE already shows this project, raise that window via AX.
+        // Never route through the Toolbox CLI launcher here: its generated
+        // scripts run `open -na`, which spawns a NEW IDE instance instead
+        // of reusing the running one.
+        if raiseJetBrainsProjectWindow(projectPath, bundleIdentifier: bundleIdentifier) {
+            return true
+        }
+
+        // Project not visible in a running IDE: open it via a plain `open -b`
+        // (no -n), which reuses the existing instance or launches one.
+        if (try? openAction(["-b", bundleIdentifier, projectPath])) != nil {
+            return true
+        }
+
+        // Last resort: the CLI launcher (may spawn a fresh instance, but at
+        // this point the IDE could not be reached any other way).
         guard let cli = Self.jetbrainsCLI[bundleIdentifier] else {
             return false
         }
         return processRunner(cli, [projectPath])
+    }
+
+    /// Window titles in JetBrains IDEs lead with the project name:
+    /// "project – file.swift", "project [module]", or a bare "project".
+    static func jetBrainsWindowTitleMatches(title: String, projectBasename: String) -> Bool {
+        guard !title.isEmpty, !projectBasename.isEmpty else {
+            return false
+        }
+        if title == projectBasename {
+            return true
+        }
+        // Require a separator right after the name so "onepiece" does not
+        // match "onepiece-v2 – Main.kt".
+        return title.hasPrefix(projectBasename + " ") || title.hasPrefix(projectBasename + " –")
+    }
+
+    /// Bring the running IDE window for `projectPath` to the front.
+    /// Returns false when the IDE is not running or no window matches.
+    private func raiseJetBrainsProjectWindow(_ projectPath: String, bundleIdentifier: String) -> Bool {
+        guard let app = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == bundleIdentifier
+        }) else { return false }
+
+        let basename = (projectPath as NSString).lastPathComponent
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var windowsRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
+        guard let windows = windowsRef as? [AXUIElement] else { return false }
+
+        for window in windows {
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+            guard let title = titleRef as? String,
+                  Self.jetBrainsWindowTitleMatches(title: title, projectBasename: basename) else {
+                continue
+            }
+            app.activate()
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+            AXUIElementSetAttributeValue(axApp, kAXFocusedWindowAttribute as CFString, window)
+            return true
+        }
+        return false
     }
 
     /// Switch to the matching terminal tab inside a JetBrains IDE.

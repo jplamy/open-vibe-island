@@ -112,6 +112,24 @@ struct PerformancePolicyTests {
     }
 
     @Test
+    func jetBrainsWindowTitleMatchesProjectBasename() {
+        // Typical IntelliJ titles: "project – file.swift", "project [module]", bare "project".
+        #expect(TerminalJumpService.jetBrainsWindowTitleMatches(
+            title: "open-vibe-island – TerminalJumpService.swift", projectBasename: "open-vibe-island"))
+        #expect(TerminalJumpService.jetBrainsWindowTitleMatches(
+            title: "onepiece", projectBasename: "onepiece"))
+        #expect(TerminalJumpService.jetBrainsWindowTitleMatches(
+            title: "onepiece [back]", projectBasename: "onepiece"))
+        // Prefix of a longer project name must NOT match.
+        #expect(!TerminalJumpService.jetBrainsWindowTitleMatches(
+            title: "onepiece-v2 – Main.kt", projectBasename: "onepiece"))
+        #expect(!TerminalJumpService.jetBrainsWindowTitleMatches(
+            title: "Welcome to IntelliJ IDEA", projectBasename: "onepiece"))
+        #expect(!TerminalJumpService.jetBrainsWindowTitleMatches(
+            title: "", projectBasename: "onepiece"))
+    }
+
+    @Test
     func inactiveSessionDotDoesNotRequireAnimationTimeline() {
         #expect(IslandSessionStateIndicator.animatedDot.timelineInterval(
             presence: .inactive,
