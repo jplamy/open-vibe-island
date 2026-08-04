@@ -130,6 +130,52 @@ struct PerformancePolicyTests {
     }
 
     @Test
+    func jetBrainsProjectRootResolvesSessionCwdToOpenedProject() {
+        let opened = ["/U/j/src/onepiece", "/U/j/src/FNB-DCT-MIDDLEWARE"]
+        let recent = opened + ["/U/j/src/onepiece-middleware", "/U/j/src/planner"]
+
+        // cwd inside an opened project resolves to that project root.
+        #expect(TerminalJumpService.jetBrainsBestProjectRoot(
+            for: "/U/j/src/onepiece/specs/001-wfj/contracts", opened: opened, recent: recent
+        ) == "/U/j/src/onepiece")
+        // cwd exactly at the project root.
+        #expect(TerminalJumpService.jetBrainsBestProjectRoot(
+            for: "/U/j/src/onepiece", opened: opened, recent: recent
+        ) == "/U/j/src/onepiece")
+        // "onepiece-middleware" must not be trapped by the "onepiece" prefix.
+        #expect(TerminalJumpService.jetBrainsBestProjectRoot(
+            for: "/U/j/src/onepiece-middleware/sub", opened: opened, recent: recent
+        ) == "/U/j/src/onepiece-middleware")
+        // Unknown cwd: no resolution.
+        #expect(TerminalJumpService.jetBrainsBestProjectRoot(
+            for: "/tmp/elsewhere", opened: opened, recent: recent
+        ) == nil)
+    }
+
+    @Test
+    func jetBrainsRecentProjectsXMLParsesOpenedAndRecentEntries() {
+        let xml = """
+        <application>
+          <component name="RecentProjectsManager">
+            <option name="additionalInfo">
+              <map>
+                <entry key="$USER_HOME$/src/alpha">
+                  <value><RecentProjectMetaInfo frameTitle="alpha"></RecentProjectMetaInfo></value>
+                </entry>
+                <entry key="$USER_HOME$/src/beta">
+                  <value><RecentProjectMetaInfo opened="true" frameTitle="beta"></RecentProjectMetaInfo></value>
+                </entry>
+              </map>
+            </option>
+          </component>
+        </application>
+        """
+        let parsed = TerminalJumpService.jetBrainsProjects(fromRecentProjectsXML: xml, homeDirectory: "/Users/x")
+        #expect(parsed.opened == ["/Users/x/src/beta"])
+        #expect(parsed.recent.sorted() == ["/Users/x/src/alpha", "/Users/x/src/beta"])
+    }
+
+    @Test
     func inactiveSessionDotDoesNotRequireAnimationTimeline() {
         #expect(IslandSessionStateIndicator.animatedDot.timelineInterval(
             presence: .inactive,

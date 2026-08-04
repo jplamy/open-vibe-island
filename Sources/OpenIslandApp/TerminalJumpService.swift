@@ -252,7 +252,26 @@ struct TerminalJumpService {
         self.warpFrontmostChecker = warpFrontmostChecker
     }
 
+    /// Temporary debug tracing to a plain file — the unified log proved
+    /// unreliable for release-build NSLog output during this investigation.
+    static func debugTrace(_ message: String) {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/open-island/jump-debug.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "\(stamp) \(message)\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? line.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
     func jump(to target: JumpTarget) throws -> String {
+        Self.debugTrace(
+            "jump(to:) terminalApp='\(target.terminalApp)' cwd='\(target.workingDirectory ?? "nil")' tty='\(target.terminalTTY ?? "nil")' tmux='\(target.tmuxTarget ?? "nil")' pane='\(target.paneTitle)'"
+        )
         // tmux sessions: switch pane first, then use the terminal-specific
         // jump to focus the correct window/tab (not just activate the app).
         if let tmuxTarget = target.tmuxTarget, !tmuxTarget.isEmpty {
@@ -514,18 +533,106 @@ struct TerminalJumpService {
         "com.jetbrains.rustrover": "rustrover",
     ]
 
+    /// Maps bundle identifiers to the product's config directory prefix in
+    /// `~/Library/Application Support/JetBrains/`.
+    private static let jetbrainsConfigPrefix: [String: String] = [
+        "com.jetbrains.intellij": "IntelliJIdea",
+        "com.jetbrains.WebStorm": "WebStorm",
+        "com.jetbrains.pycharm": "PyCharm",
+        "com.jetbrains.goland": "GoLand",
+        "com.jetbrains.CLion": "CLion",
+        "com.jetbrains.rubymine": "RubyMine",
+        "com.jetbrains.PhpStorm": "PhpStorm",
+        "com.jetbrains.rider": "Rider",
+        "com.jetbrains.rustrover": "RustRover",
+    ]
+
+    /// Longest opened-project (then recent-project) path that is a strict
+    /// path-prefix of `cwd`. A session's working directory is often a
+    /// subdirectory of the IDE project; opening that subdirectory directly
+    /// would create a brand-new project window.
+    static func jetBrainsBestProjectRoot(for cwd: String, opened: [String], recent: [String]) -> String? {
+        func isPathPrefix(_ root: String, of path: String) -> Bool {
+            path == root || path.hasPrefix(root + "/")
+        }
+        for pool in [opened, recent] {
+            if let best = pool.filter({ isPathPrefix($0, of: cwd) }).max(by: { $0.count < $1.count }) {
+                return best
+            }
+        }
+        return nil
+    }
+
+    /// Parses a JetBrains `recentProjects.xml`, returning currently-opened
+    /// project paths and all recent ones, with `$USER_HOME$` expanded.
+    static func jetBrainsProjects(
+        fromRecentProjectsXML xml: String,
+        homeDirectory: String
+    ) -> (opened: [String], recent: [String]) {
+        var opened: [String] = []
+        var recent: [String] = []
+        let pattern = /<entry key="([^"]+)">(.*?)<\/entry>/.dotMatchesNewlines()
+        for match in xml.matches(of: pattern) {
+            let path = String(match.1).replacingOccurrences(of: "$USER_HOME$", with: homeDirectory)
+            recent.append(path)
+            if match.2.contains(#"opened="true""#) {
+                opened.append(path)
+            }
+        }
+        return (opened, recent)
+    }
+
+    /// Resolve the session's cwd to the enclosing project the IDE actually
+    /// has open, using the product's most recently written recentProjects.xml.
+    private func resolveJetBrainsProjectRoot(for cwd: String, bundleIdentifier: String) -> String? {
+        guard let prefix = Self.jetbrainsConfigPrefix[bundleIdentifier] else {
+            return nil
+        }
+        let jetbrainsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/JetBrains", isDirectory: true)
+        let candidates = ((try? FileManager.default.contentsOfDirectory(
+            at: jetbrainsDir, includingPropertiesForKeys: [.contentModificationDateKey]
+        )) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix(prefix) }
+            .map { $0.appendingPathComponent("options/recentProjects.xml") }
+            .filter { FileManager.default.fileExists(atPath: $0.path) }
+            .sorted { lhs, rhs in
+                let l = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let r = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return l > r
+            }
+        guard let xmlURL = candidates.first,
+              let xml = try? String(contentsOf: xmlURL, encoding: .utf8) else {
+            return nil
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let projects = Self.jetBrainsProjects(fromRecentProjectsXML: xml, homeDirectory: home)
+        return Self.jetBrainsBestProjectRoot(for: cwd, opened: projects.opened, recent: projects.recent)
+    }
+
     private func jumpToJetBrainsProject(_ projectPath: String, bundleIdentifier: String) -> Bool {
+        // The session cwd may be a subdirectory of the IDE project; resolve
+        // it to the project root the IDE actually knows about, otherwise
+        // `open` would create a new project window for the subdirectory.
+        let projectRoot = resolveJetBrainsProjectRoot(for: projectPath, bundleIdentifier: bundleIdentifier)
+            ?? projectPath
+        Self.debugTrace("resolved project root '\(projectRoot)' for cwd '\(projectPath)'")
+
         // If the IDE already shows this project, raise that window via AX.
         // Never route through the Toolbox CLI launcher here: its generated
         // scripts run `open -na`, which spawns a NEW IDE instance instead
         // of reusing the running one.
-        if raiseJetBrainsProjectWindow(projectPath, bundleIdentifier: bundleIdentifier) {
+        if raiseJetBrainsProjectWindow(projectRoot, bundleIdentifier: bundleIdentifier) {
+            Self.debugTrace("raised existing window for \(projectRoot)")
             return true
         }
 
-        // Project not visible in a running IDE: open it via a plain `open -b`
-        // (no -n), which reuses the existing instance or launches one.
-        if (try? openAction(["-b", bundleIdentifier, projectPath])) != nil {
+        // Project window not raised (AX denied or no title match): a plain
+        // `open -b` (no -n) on the PROJECT ROOT focuses the already-open
+        // project in the running instance, or opens it without spawning a
+        // second IDE instance.
+        if (try? openAction(["-b", bundleIdentifier, projectRoot])) != nil {
+            Self.debugTrace("fell back to open -b for \(projectRoot)")
             return true
         }
 
@@ -556,19 +663,28 @@ struct TerminalJumpService {
     private func raiseJetBrainsProjectWindow(_ projectPath: String, bundleIdentifier: String) -> Bool {
         guard let app = NSWorkspace.shared.runningApplications.first(where: {
             $0.bundleIdentifier == bundleIdentifier
-        }) else { return false }
+        }) else {
+            Self.debugTrace("IDE not running: \(bundleIdentifier)")
+            return false
+        }
 
         let basename = (projectPath as NSString).lastPathComponent
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
         var windowsRef: CFTypeRef?
-        AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
-        guard let windows = windowsRef as? [AXUIElement] else { return false }
+        let axErr = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
+        guard let windows = windowsRef as? [AXUIElement] else {
+            Self.debugTrace("AX windows unavailable (err=\(axErr.rawValue)) for \(bundleIdentifier)")
+            return false
+        }
+        Self.debugTrace("looking for '\(basename)' among \(windows.count) windows")
 
         for window in windows {
             var titleRef: CFTypeRef?
             AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
-            guard let title = titleRef as? String,
-                  Self.jetBrainsWindowTitleMatches(title: title, projectBasename: basename) else {
+            let title = titleRef as? String ?? "<no title>"
+            let matches = Self.jetBrainsWindowTitleMatches(title: title, projectBasename: basename)
+            Self.debugTrace("window title='\(title)' match=\(matches)")
+            guard matches else {
                 continue
             }
             app.activate()
